@@ -1,0 +1,25 @@
+# ============================================================
+# QuizArena — files that must never be committed to GitHub
+# ============================================================
+
+# Database credentials (generated at runtime by install.php)
+app/config.php
+
+# Runtime logs
+*.log
+app/logs/*
+!app/logs/.gitkeep
+
+# Runtime uploads (certificates, logos, photos, temp imports)
+assets/uploads/logos/*
+!assets/uploads/logos/index.html
+assets/uploads/photos/*
+!assets/uploads/photos/index.html
+assets/uploads/certificates/*
+!assets/uploads/certificates/index.html
+assets/uploads/temp/*
+!assets/uploads/temp/index.html
+
+# Original distribution archives (contain old credentials / duplicate code)
+_quizs.zip
+QuizArena-Hostinger.zip

@@ -1,0 +1,13 @@
+# Uploads directory — block script execution
+<IfModule mod_authz_core.c>
+  <FilesMatch "\.(php|phtml|php3|php4|php5|php7|php8|pl|py|cgi|sh)$">
+    Require all denied
+  </FilesMatch>
+</IfModule>
+<IfModule !mod_authz_core.c>
+  <FilesMatch "\.(php|phtml|php3|php4|php5|php7|php8|pl|py|cgi|sh)$">
+    Order allow,deny
+    Deny from all
+  </FilesMatch>
+</IfModule>
+Options -Indexes

@@ -1,0 +1,115 @@
+/* ============================================================
+   QuizArena — Dashboard Layout Styles
+   ============================================================ */
+
+.dash-body { background: #f1f5f9; min-height: 100vh; }
+
+.dash-layout { display: flex; min-height: 100vh; }
+
+/* ---------- Sidebar ---------- */
+.dash-sidebar {
+    width: 258px; flex-shrink: 0; background: #0f172a; color: #cbd5e1;
+    display: flex; flex-direction: column; position: sticky; top: 0; height: 100vh;
+}
+.dash-brand {
+    padding: 1.1rem 1.2rem; border-bottom: 1px solid rgba(255,255,255,.07);
+}
+.dash-nav { flex: 1; overflow-y: auto; padding: .9rem .7rem; }
+.dash-nav::-webkit-scrollbar { width: 4px; }
+.dash-nav::-webkit-scrollbar-thumb { background: rgba(255,255,255,.15); border-radius: 4px; }
+.dash-nav-item {
+    display: flex; align-items: center; gap: .7rem;
+    padding: .62rem .85rem; border-radius: 10px; color: #cbd5e1;
+    text-decoration: none; font-size: .88rem; font-weight: 500; margin-bottom: 2px;
+    transition: background .15s ease, color .15s ease;
+}
+.dash-nav-item i { font-size: 1.05rem; width: 20px; text-align: center; }
+.dash-nav-item:hover { background: rgba(255,255,255,.06); color: #fff; }
+.dash-nav-item.active {
+    background: linear-gradient(90deg, #4f46e5, #6d28d9); color: #fff; font-weight: 600;
+    box-shadow: 0 4px 12px rgba(79, 70, 229, .35);
+}
+.dash-nav-badge {
+    margin-left: auto; background: rgba(255,255,255,.14); color: #fbbf24;
+    font-size: .72rem; font-weight: 700; padding: .1rem .5rem; border-radius: 20px;
+}
+.dash-sidebar-foot { border-top: 1px solid rgba(255,255,255,.07); padding: .7rem; }
+.dash-sidebar-backdrop { display: none; }
+
+/* ---------- Main area ---------- */
+.dash-main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+
+.dash-topbar {
+    background: #fff; border-bottom: 1px solid var(--qa-border);
+    padding: .75rem 1.4rem; display: flex; align-items: center; gap: .8rem;
+    position: sticky; top: 0; z-index: 40;
+}
+.dash-content { padding: 1.4rem; flex: 1; }
+.dash-footer {
+    padding: .9rem 1.4rem; color: #94a3b8; font-size: .8rem;
+    border-top: 1px solid var(--qa-border);
+}
+
+.topbar-coin {
+    background: #fffbeb; border: 1px solid #fde68a; color: #92400e;
+    border-radius: 30px; padding: .3rem .85rem; font-size: .85rem;
+    text-decoration: none; display: inline-flex; align-items: center; gap: .3rem;
+}
+
+/* ---------- Stat cards ---------- */
+.stat-card {
+    background: #fff; border: 1px solid var(--qa-border); border-radius: 14px;
+    padding: 1.1rem 1.2rem; box-shadow: var(--qa-shadow-sm); height: 100%;
+    display: flex; align-items: flex-start; gap: .9rem;
+    transition: transform .15s ease, box-shadow .15s ease;
+}
+.stat-card:hover { transform: translateY(-2px); box-shadow: var(--qa-shadow); }
+.stat-card .stat-icon {
+    width: 46px; height: 46px; border-radius: 12px; display: inline-flex;
+    align-items: center; justify-content: center; font-size: 1.25rem; flex-shrink: 0;
+}
+
+/* ---------- Cards ---------- */
+.dash-card {
+    background: #fff; border: 1px solid var(--qa-border); border-radius: 14px;
+    box-shadow: var(--qa-shadow-sm); margin-bottom: 1.25rem;
+}
+.dash-card-header {
+    padding: 1rem 1.25rem; border-bottom: 1px solid #f1f5f9;
+    display: flex; align-items: center; justify-content: space-between; gap: .5rem; flex-wrap: wrap;
+}
+.dash-card-body { padding: 1.25rem; }
+.dash-card-title { font-weight: 700; color: var(--qa-ink); font-size: 1rem; margin: 0; }
+
+/* ---------- Tables ---------- */
+.table-dash { margin: 0; font-size: .87rem; }
+.table-dash thead th {
+    background: #f8fafc; color: #64748b; font-size: .7rem; text-transform: uppercase;
+    letter-spacing: .6px; border-bottom: 1px solid var(--qa-border); padding: .65rem .9rem; white-space: nowrap;
+}
+.table-dash tbody td { padding: .7rem .9rem; vertical-align: middle; border-color: #f1f5f9; }
+.table-dash tbody tr:hover { background: #fafbff; }
+
+/* ---------- Misc ---------- */
+.wallet-hero {
+    background: linear-gradient(135deg, #1e1b4b 0%, #4f46e5 60%, #7c3aed 100%);
+    border-radius: 18px; color: #fff; padding: 1.6rem; box-shadow: var(--qa-shadow-lg);
+}
+.wallet-balance { font-size: 2.4rem; font-weight: 800; letter-spacing: -.5px; }
+
+.quiz-row { transition: transform .15s ease; }
+.quiz-row:hover { transform: translateY(-2px); }
+
+/* Mobile: drawer sidebar */
+@media (max-width: 991.98px) {
+    .dash-sidebar {
+        position: fixed; left: 0; top: 0; bottom: 0; z-index: 1000;
+        transform: translateX(-100%); transition: transform .22s ease; height: 100vh;
+    }
+    .dash-sidebar.open { transform: translateX(0); }
+    .dash-sidebar-backdrop.show {
+        display: block; position: fixed; inset: 0; background: rgba(15,23,42,.5); z-index: 999;
+    }
+    .dash-content { padding: 1rem; }
+    .dash-topbar { padding: .65rem .9rem; }
+}
