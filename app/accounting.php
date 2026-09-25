@@ -303,6 +303,24 @@ function acc_validate_inputs(string $source_type, string $class, array $inputs):
         }
     }
 
+    // Reward rows exist only for a positive payout (zero rows are never written;
+    // callers simply skip when the amount is 0).
+    if ($source_type === 'signup' && ($inputs['customer_reward'] ?? 0) <= 0) {
+        throw new AccException('signup rows are written only for a positive bonus (customer_reward > 0).');
+    }
+    if ($source_type === 'referral' && ($inputs['commission_referral'] ?? 0) <= 0) {
+        throw new AccException('referral rows are written only for a positive reward (commission_referral > 0).');
+    }
+
+    // Reversal-shaped rows (sign 'nonpos') must reverse at least one non-zero amount.
+    if ($spec['sign'] === 'nonpos') {
+        $total = abs($inputs['gross'] ?? 0) + abs($inputs['fees'] ?? 0) + abs($inputs['taxes'] ?? 0);
+        foreach (acc_payout_cols() as $c) $total += abs($inputs[$c] ?? 0);
+        if ($total === 0) {
+            throw new AccException("'{$source_type}' is a reversal type — it must reverse at least one non-zero amount.");
+        }
+    }
+
     $inputs['class'] = $class;
     $inputs['source_type'] = $source_type;
     return $inputs;
@@ -408,6 +426,19 @@ function acc_audit_collision(string $table, string $key, string $given_hash, str
         ['key' => $key, 'stored_hash' => $stored_hash],
         ['key' => $key, 'given_hash' => $given_hash],
         'Idempotency key reused with a different payload — write refused.', $key);
+}
+
+/**
+ * Lost-race detection: a concurrent writer inserted the same unique key first.
+ * Covers MySQL/MariaDB ('Duplicate entry') and SQLite ('UNIQUE constraint failed').
+ */
+function acc_is_dup_key(Throwable $e): bool {
+    if (!($e instanceof PDOException)) return false;
+    $msg = $e->getMessage();
+    return $e->getCode() === '23000'
+        || strpos($msg, 'Duplicate entry') !== false
+        || strpos($msg, 'UNIQUE constraint failed') !== false
+        || strpos($msg, 'Integrity constraint violation: 19') !== false;
 }
 
 /* ------------------------------------------------------------------ *
@@ -530,6 +561,7 @@ function ledger_write(array $args): array {
         // User-id snapshot columns (reports never depend on live hierarchy).
         $uid = fn(string $k) => isset($args[$k]) ? ((int) $args[$k] ?: null) : null;
 
+try {
         dbq(
             "INSERT INTO qa_company_ledger
              (idempotency_key, payload_hash, source_type, source_id, class,
@@ -562,6 +594,21 @@ function ledger_write(array $args): array {
             ]
         );
         $ledger_id = db_id();
+} catch (PDOException $e) {
+        // Lost an insert race on the unique key: re-read the winner and compare hashes.
+        if (!acc_is_dup_key($e)) throw $e;
+        $winner = dbrow("SELECT id, payload_hash FROM qa_company_ledger WHERE idempotency_key = ?", [$key]);
+        if ($winner && (string) $winner['payload_hash'] === $row_hash) {
+            // Identical economics won concurrently: roll OUR uncommitted payouts back
+            // (never double-pay) and report the idempotent no-op.
+            tx_release($outer, false); $committed = true;
+            return ['id' => (int) $winner['id'], 'duplicate' => true, 'wallet_txns' => [], 'row' => $row];
+        }
+        tx_release($outer, false); $committed = true;
+        acc_audit_collision('qa_company_ledger', $key, $row_hash, $winner ? (string) $winner['payload_hash'] : '<gone>');
+        throw new AccIdempotencyCollision(
+            "Idempotency collision on ledger key '{$key}' (concurrent write race).", $key, 'qa_company_ledger');
+    }
 
         acc_audit('ledger_write', 'qa_company_ledger', $ledger_id, null,
             ['key' => $key, 'source_type' => $type, 'class' => $class,
@@ -641,19 +688,31 @@ function commission_write(array $args): array {
                 "Idempotency collision on commission payout_key '{$key}'.", $key, 'qa_commissions');
         }
 
-        dbq("INSERT INTO qa_commissions
-             (payout_key, payload_hash, rule_id, source_type, source_id, line_no,
-              beneficiary_user_id, beneficiary_role, amount, coin_amount, coin_value,
-              reversal_of, status, hierarchy_snapshot, created_at)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'active', ?, NOW())",
-            [
-                $key, $hash, $rule_id, $type, (int) $args['source_id'], $args['line_no'] ?? null,
-                (int) $args['beneficiary_user_id'], (string) $args['beneficiary_role'],
-                $amount, $coins, $coins > 0 ? $cv : 0,
-                $args['reversal_of'] ?? null,
-                json_encode($args['hierarchy_snapshot'] ?? [], JSON_UNESCAPED_UNICODE),
-            ]);
-        $id = db_id();
+        try {
+            dbq("INSERT INTO qa_commissions
+                 (payout_key, payload_hash, rule_id, source_type, source_id, line_no,
+                  beneficiary_user_id, beneficiary_role, amount, coin_amount, coin_value,
+                  reversal_of, status, hierarchy_snapshot, created_at)
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'active', ?, NOW())",
+                [
+                    $key, $hash, $rule_id, $type, (int) $args['source_id'], $args['line_no'] ?? null,
+                    (int) $args['beneficiary_user_id'], (string) $args['beneficiary_role'],
+                    $amount, $coins, $coins > 0 ? $cv : 0,
+                    $args['reversal_of'] ?? null,
+                    json_encode($args['hierarchy_snapshot'] ?? [], JSON_UNESCAPED_UNICODE),
+                ]);
+            $id = db_id();
+        } catch (PDOException $e) {
+            if (!acc_is_dup_key($e)) throw $e;
+            $winner = dbrow("SELECT id, payload_hash FROM qa_commissions WHERE payout_key = ?", [$key]);
+            tx_release($outer, false); $committed = true;   // discard our (uncommitted) side effects
+            if ($winner && (string) $winner['payload_hash'] === $hash) {
+                return ['id' => (int) $winner['id'], 'duplicate' => true];
+            }
+            acc_audit_collision('qa_commissions', $key, $hash, $winner ? (string) $winner['payload_hash'] : '<gone>');
+            throw new AccIdempotencyCollision(
+                "Idempotency collision on commission payout_key '{$key}' (concurrent write race).", $key, 'qa_commissions');
+        }
         tx_release($outer, true); $committed = true;
         return ['id' => $id, 'duplicate' => false];
     } catch (Throwable $e) {
@@ -674,6 +733,27 @@ function commission_write(array $args): array {
 function apply_commission_cap(array $items, int $gross, ?int $cap_bp = null): array {
     $cap_bp = $cap_bp ?? (int) setting('commission_cap_percent_bp', 4000);
     if ($gross < 0) throw new AccException('apply_commission_cap: gross must be >= 0.');
+    if ($cap_bp < 0 || $cap_bp > 10000) {
+        throw new AccException('apply_commission_cap: cap must be within 0..10000 basis points.');
+    }
+    // ONE common gross base is mandatory: every rule is computed against the
+    // single $gross passed here. A rule carrying its own differing base is a
+    // configuration error and is rejected (never silently mixed).
+    foreach ($items as $it) {
+        if (array_key_exists('base', $it) && (int) $it['base'] !== $gross) {
+            throw new AccException(
+                'apply_commission_cap: mixed gross bases are forbidden — rule \''
+                . (string) ($it['role'] ?? '?') . '\' declares base ' . (int) $it['base']
+                . ' while the common base is ' . $gross . '.');
+        }
+        if (($it['rate_type'] ?? '') === 'percent_bp'
+            && ((int) $it['rate_value'] < 0 || (int) $it['rate_value'] > 10000)) {
+            throw new AccException('apply_commission_cap: percent rate must be within 0..10000 bp.');
+        }
+        if (($it['rate_type'] ?? '') === 'flat_paise' && (int) $it['rate_value'] < 0) {
+            throw new AccException('apply_commission_cap: flat rate must be >= 0.');
+        }
+    }
 
     foreach ($items as &$it) {
         $it['num'] = $it['rate_type'] === 'percent_bp'
@@ -763,16 +843,27 @@ function stock_move(array $args): array {
             throw new AccException("stock_move: non-negative assert failed (stock {$p['stock']} + delta {$delta} < 0).");
         }
 
-        dbq("INSERT INTO qa_stock_movements
-             (product_id, type, delta, balance_after, ref_type, ref_id,
-              idempotency_key, payload_hash, note, created_by, created_at)
-             VALUES (?,?,?,?,?,?,?,?,?,?,NOW())",
-            [
-                $product_id, $type, $delta, $new_stock, $ref_type, $ref_id,
-                $key, $hash, (string) ($args['note'] ?? null) ?: null,
-                (int) ($_SESSION['user_id'] ?? 0),
-            ]);
-        $mid = db_id();
+        try {
+            dbq("INSERT INTO qa_stock_movements
+                 (product_id, type, delta, balance_after, ref_type, ref_id,
+                  idempotency_key, payload_hash, note, created_by, created_at)
+                 VALUES (?,?,?,?,?,?,?,?,?,?,NOW())",
+                [
+                    $product_id, $type, $delta, $new_stock, $ref_type, $ref_id,
+                    $key, $hash, (string) ($args['note'] ?? null) ?: null,
+                    (int) ($_SESSION['user_id'] ?? 0),
+                ]);
+            $mid = db_id();
+        } catch (PDOException $e) {
+            if (!acc_is_dup_key($e)) throw $e;
+            $winner = dbrow("SELECT id, payload_hash FROM qa_stock_movements WHERE idempotency_key = ?", [$key]);
+            tx_release($outer, false); $committed = true;   // discard our movement + stock update
+            if ($winner && (string) $winner['payload_hash'] === $hash) {
+                return ['id' => (int) $winner['id'], 'duplicate' => true, 'balance_after' => null];
+            }
+            acc_audit_collision('qa_stock_movements', $key, $hash, $winner ? (string) $winner['payload_hash'] : '<gone>');
+            throw new AccIdempotencyCollision("Idempotency collision on stock key '{$key}' (concurrent write race).", $key, 'qa_stock_movements');
+        }
 
         dbq("UPDATE qa_products SET stock = ?, updated_at = NOW() WHERE id = ?", [$new_stock, $product_id]);
 
@@ -786,6 +877,20 @@ function stock_move(array $args): array {
         if (!$committed) tx_release($outer, false);
         throw $e;
     }
+}
+
+/*
+ * ⚠ STOCK RESERVATION IS NOT IMPLEMENTED (locked plan: defined-but-unimplemented).
+ * Checkout / order-confirmation code MUST NOT assume a reservation phase exists —
+ * stock is only mutated by stock_move() at confirmation time. These stubs fail
+ * loudly so a future caller breaks in development instead of double-selling.
+ */
+function stock_reserve(int $product_id, int $qty, string $ref_type = '', int $ref_id = 0): void {
+    throw new AccException('stock_reserve() is not implemented — stock reservation is unavailable. Use stock_move() at order confirmation.');
+}
+
+function stock_release(int $product_id, int $qty, string $ref_type = '', int $ref_id = 0): void {
+    throw new AccException('stock_release() is not implemented — stock reservation is unavailable.');
 }
 
 /** Invariant check: product stock == Σ movements (used by verification + reports). */
