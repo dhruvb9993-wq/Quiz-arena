@@ -67,6 +67,12 @@ function wallet_apply($user_id, $type, $category, $amount, $opts = []) {
         'signup_bonus', 'admin_add', 'admin_deduct', 'entry_fee', 'refund',
         'completion_bonus', 'passing_reward', 'rank_reward', 'transfer_sent',
         'transfer_received', 'quiz_reward',
+        // v3.3 Phase A categories (wallet category ENUM appended by the migration;
+        // used only by app/accounting.php after activation)
+        'purchase', 'purchase_reward', 'purchase_refund',
+        'commission_seller', 'commission_salesperson', 'commission_city',
+        'commission_district', 'commission_state', 'commission_referral',
+        'commission_reversal', 'withdrawal', 'withdrawal_reversal',
     ];
     if (!in_array($category, $allowed_categories, true)) {
         return ['ok' => false, 'txn_id' => null, 'balance_after' => null, 'error' => 'Invalid transaction category.'];
@@ -104,6 +110,17 @@ function wallet_apply($user_id, $type, $category, $amount, $opts = []) {
         return ['ok' => false, 'txn_id' => null, 'balance_after' => null, 'error' => 'Invalid transaction type.'];
     }
 
+    // v3.3: optional accounting stamps (Phase A columns). Included in the INSERT
+    // only when provided, so legacy calls keep byte-identical SQL pre-migration.
+    $stamp_cols = $stamp_vals = [];
+    foreach (['coin_value' => 'coin_value', 'amount_inr' => 'amount_inr',
+              'source_type' => 'source_type', 'source_id' => 'source_id'] as $opt => $col) {
+        if (array_key_exists($opt, $opts) && $opts[$opt] !== null) {
+            $stamp_cols[] = $col;
+            $stamp_vals[] = $opts[$opt];
+        }
+    }
+
     $school_id = (int) ($wallet['school_id'] ?: ($opts['school_id'] ?? 0));
     $sender_uid   = $opts['sender_user_id']   ?? null;
     $receiver_uid = $opts['receiver_user_id'] ?? null;
@@ -116,9 +133,9 @@ function wallet_apply($user_id, $type, $category, $amount, $opts = []) {
         "INSERT INTO qa_wallet_transactions
             (transaction_id, transfer_group_id, user_id, wallet_id, school_id, type, category, amount,
              balance_after, sender_user_id, sender_username, receiver_user_id, receiver_username,
-             reference, description, status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
-        [
+             reference, description, status" . ($stamp_cols ? ', ' . implode(', ', $stamp_cols) : '') . ", created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?" . ($stamp_cols ? str_repeat(', ?', count($stamp_cols)) : '') . ", NOW())",
+        array_merge([
             $tid,
             $opts['transfer_group_id'] ?? null,
             $user_id,
@@ -133,7 +150,7 @@ function wallet_apply($user_id, $type, $category, $amount, $opts = []) {
             $opts['reference'] ?? null,
             $opts['description'] ?? null,
             $opts['status'] ?? 'completed',
-        ]
+        ], $stamp_vals)
     );
 
     return ['ok' => true, 'txn_id' => $tid, 'balance_after' => $new_balance, 'error' => null];

@@ -71,3 +71,27 @@ php upgrade/index.php --to=39 --backup-phrase="..." --activate --activation-reas
 - `verify_table_shape()` compares COLUMN_TYPE exactly (case/display-width
   normalised). Any drift aborts instead of mutating.
 - The real MySQL/MariaDB staging drill is **mandatory** before production.
+
+## qa_orders.uq_order_no — business & uniqueness behavior (Phase B documentation)
+
+`uq_order_no` is a UNIQUE index on `qa_orders.order_no VARCHAR(30)`.
+
+- **Business purpose:** `order_no` is the customer-facing order reference
+  (shown on the order screen, wallet transaction references, refund records,
+  and the company ledger source key `order:{id}` links by the numeric order id,
+  while humans reference the order by its `order_no`).
+- **Generation:** application-generated at cart confirmation, pattern
+  `OR` + `ymdHis` timestamp + 6 random hex chars (same collision-safe
+  construction as wallet `transaction_id`s), assigned server-side inside the
+  order-creation transaction — never accepted from the browser.
+- **Uniqueness guarantee:** the UNIQUE index makes a duplicated order number
+  impossible at the storage level, even under concurrent checkouts or a
+  manual retry after timeout. A generated collision (astronomically unlikely)
+  surfaces as a duplicate-key error; the order flow regenerates and retries
+  (same pattern as `txn_id()`'s 5-attempt retry).
+- **Idempotency relationship:** order financial writes use the ledger key
+  `order:{order_id}`, NOT `order_no` — so a regenerated `order_no` (pre-commit
+  retry) never forks ledger history; `order_no` is presentation identity,
+  `order_id` is the financial identity.
+- **Format invariants enforced in code (order phase):** `^[A-Z0-9]{1,30}$`,
+  uppercase, no separators — safe for invoices, QR codes, and CSV exports.

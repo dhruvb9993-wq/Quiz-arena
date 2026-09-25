@@ -37,6 +37,7 @@ require_once __DIR__ . '/auth.php';
 require_once __DIR__ . '/uploads.php';
 require_once __DIR__ . '/mailer.php';
 require_once __DIR__ . '/wallet.php';
+require_once __DIR__ . '/accounting.php';
 require_once __DIR__ . '/quiz.php';
 require_once __DIR__ . '/certificate.php';
 require_once __DIR__ . '/reports.php';
