@@ -430,15 +430,28 @@ function acc_audit_collision(string $table, string $key, string $given_hash, str
 
 /**
  * Lost-race detection: a concurrent writer inserted the same unique key first.
- * Covers MySQL/MariaDB ('Duplicate entry') and SQLite ('UNIQUE constraint failed').
+ *
+ * Classification is by DRIVER ERROR CODE first, message patterns second — a
+ * bare SQLSTATE is never sufficient (MySQL maps 1048 NOT NULL, 1062 duplicate,
+ * 1451/1452 FK and 3819 CHECK violations all to SQLSTATE 23000).
+ *
+ * Recognised shapes:
+ *  - MySQL/MariaDB 1062 (PDO errorInfo[1] = 1062, message contains
+ *    "… 1062 Duplicate entry '…' for key '…'") — duplicate unique key.
+ *  - SQLite PDO (errorInfo[1] = 19): "UNIQUE constraint failed: t.c" (3.7.16+)
+ *    or "column t.c is not unique" (older) — used by the local test harness.
+ * Everything else (NOT NULL, FK, CHECK, syntax, lock timeouts…) is NOT a
+ * duplicate-key error and is re-thrown by the callers.
  */
 function acc_is_dup_key(Throwable $e): bool {
     if (!($e instanceof PDOException)) return false;
+    $driverCode = $e->errorInfo[1] ?? null;          // driver-specific code
+    if ($driverCode !== null && (int) $driverCode === 1062) return true;   // MySQL/MariaDB
     $msg = $e->getMessage();
-    return $e->getCode() === '23000'
-        || strpos($msg, 'Duplicate entry') !== false
-        || strpos($msg, 'UNIQUE constraint failed') !== false
-        || strpos($msg, 'Integrity constraint violation: 19') !== false;
+    if (strpos($msg, 'Duplicate entry') !== false) return true;            // MySQL/MariaDB message fallback
+    if (strpos($msg, 'UNIQUE constraint failed') !== false) return true;   // SQLite >= 3.7.16
+    if (strpos($msg, 'is not unique') !== false) return true;              // older SQLite
+    return false;
 }
 
 /* ------------------------------------------------------------------ *
@@ -597,7 +610,10 @@ try {
 } catch (PDOException $e) {
         // Lost an insert race on the unique key: re-read the winner and compare hashes.
         if (!acc_is_dup_key($e)) throw $e;
-        $winner = dbrow("SELECT id, payload_hash FROM qa_company_ledger WHERE idempotency_key = ?", [$key]);
+        // FOR UPDATE = CURRENT read: under InnoDB REPEATABLE READ a snapshot read
+        // here could miss the winner that committed after our pre-check. The 1062
+        // guarantees a committed (or committing) unique value exists — read it NOW.
+        $winner = dbrow("SELECT id, payload_hash FROM qa_company_ledger WHERE idempotency_key = ? FOR UPDATE", [$key]);
         if ($winner && (string) $winner['payload_hash'] === $row_hash) {
             // Identical economics won concurrently: roll OUR uncommitted payouts back
             // (never double-pay) and report the idempotent no-op.
@@ -704,7 +720,7 @@ function commission_write(array $args): array {
             $id = db_id();
         } catch (PDOException $e) {
             if (!acc_is_dup_key($e)) throw $e;
-            $winner = dbrow("SELECT id, payload_hash FROM qa_commissions WHERE payout_key = ?", [$key]);
+            $winner = dbrow("SELECT id, payload_hash FROM qa_commissions WHERE payout_key = ? FOR UPDATE", [$key]);
             tx_release($outer, false); $committed = true;   // discard our (uncommitted) side effects
             if ($winner && (string) $winner['payload_hash'] === $hash) {
                 return ['id' => (int) $winner['id'], 'duplicate' => true];
@@ -856,7 +872,7 @@ function stock_move(array $args): array {
             $mid = db_id();
         } catch (PDOException $e) {
             if (!acc_is_dup_key($e)) throw $e;
-            $winner = dbrow("SELECT id, payload_hash FROM qa_stock_movements WHERE idempotency_key = ?", [$key]);
+            $winner = dbrow("SELECT id, payload_hash FROM qa_stock_movements WHERE idempotency_key = ? FOR UPDATE", [$key]);
             tx_release($outer, false); $committed = true;   // discard our movement + stock update
             if ($winner && (string) $winner['payload_hash'] === $hash) {
                 return ['id' => (int) $winner['id'], 'duplicate' => true, 'balance_after' => null];
@@ -901,13 +917,35 @@ function stock_invariant_ok(int $product_id): bool {
 }
 
 /* ------------------------------------------------------------------ *
- *  quiz_refund_rewards() — D16 helper (fee row reversed separately)
+ *  quiz_refund_rewards() — D16 clawback (locked behaviour + interpretation)
  * ------------------------------------------------------------------ *
- * Locked D16 behaviour for a refunded attempt: the quiz fee ledger row is
- * negated by a quiz_refund row (caller writes it via ledger_write); the
- * company-funded reward expense row is flipped to 'reversed' and every reward
- * wallet transaction of the attempt is set to status='reversed' — net reward
- * effect zero, no double-spending, one transaction, audited.
+ * Locked D16: a refunded attempt must have a NET-ZERO reward effect. The quiz
+ * fee row is reversed separately by the caller (a quiz_refund ledger row).
+ *
+ * Exact behaviour implemented here (interpretation documented for staging
+ * review — all original ROWS stay immutable; only status columns change):
+ *  1. The company reward ledger row (quiz/expense) is flipped to status
+ *     'reversed' — its amounts are NEVER edited, so it remains auditable.
+ *  2. Every COMPLETED reward credit wallet transaction of the attempt
+ *     (completion_bonus / passing_reward / rank_reward) is flipped to
+ *     status 'reversed' — amounts and balance_after stay immutable.
+ *  3. Because flipping a status cannot move money, the clawback writes ONE
+ *     compensating DEBIT wallet transaction (category 'refund', stamped,
+ *     reference 'quiz:attempt:{id}:clawback', amount_inr = the sum of the
+ *     credits' amount_inr) so the user's balance actually returns the reward
+ *     coins. Active wallet INR for the attempt then nets to zero, matching
+ *     the reversed ledger row (no active reward expense).
+ *  4. Idempotent: if there is no non-reversed reward row (absent or already
+ *     clawed back) it is a no-op success — repeated calls never double-debit
+ *     (the compensating debit exists only within the same transaction as the
+ *     status flips).
+ *  5. If the user can no longer fund the clawback (e.g. the reward coins were
+ *     already withdrawn/redeemed), the wallet debit fails → AccException →
+ *     the whole clawback (including status flips) rolls back; the refund flow
+ *     must then route to SA resolution. Explicit failure, never silent.
+ *  6. Audit: qa_audit_log row, action 'quiz_refund_rewards', entity
+ *     qa_quiz_attempts/{attempt_id}, old/new JSON (reward row id, reversed
+ *     txn ids, clawback debit txn id, coins) and the acting user id.
  */
 function quiz_refund_rewards(int $attempt_id, string $reason): int {
     acc_assert_active();
@@ -918,22 +956,60 @@ function quiz_refund_rewards(int $attempt_id, string $reason): int {
             "SELECT id, status FROM qa_company_ledger
               WHERE source_type = 'quiz' AND class = 'expense' AND source_id = ? AND status <> 'reversed'
               ORDER BY id DESC LIMIT 1", [$attempt_id]);
-        $reward_row_id = $reward_row ? (int) $reward_row['id'] : null;
-        if ($reward_row_id !== null) {
-            dbq("UPDATE qa_company_ledger SET status = 'reversed' WHERE id = ?", [$reward_row_id]);
+        if (!$reward_row) {
+            tx_release($outer, true); $committed = true;   // idempotent no-op
+            return 0;
         }
 
-        // Reward wallet transactions of this attempt → status 'reversed' (net zero).
-        dbq("UPDATE qa_wallet_transactions
-              SET status = 'reversed'
+        // Completed reward credit transactions of this attempt.
+        $credits = dball(
+            "SELECT id, amount, coin_value, amount_inr FROM qa_wallet_transactions
               WHERE source_type = 'quiz' AND source_id = ? AND type = 'credit' AND status = 'completed'
                 AND category IN ('completion_bonus','passing_reward','rank_reward')", [$attempt_id]);
+        $total_coins = 0; $total_inr = 0; $txn_ids = [];
+        foreach ($credits as $c) {
+            $txn_ids[] = (int) $c['id'];
+            $total_coins += (int) $c['amount'];
+            $total_inr   += (int) ($c['amount_inr'] ?? ((int) $c['amount'] * (int) $c['coin_value']));
+        }
+
+        // Status flips (rows stay — immutable amounts, audit trail intact).
+        foreach ($txn_ids as $tid) {
+            dbq("UPDATE qa_wallet_transactions SET status = 'reversed' WHERE id = ?", [$tid]);
+        }
+        dbq("UPDATE qa_company_ledger SET status = 'reversed' WHERE id = ?", [(int) $reward_row['id']]);
+
+        // Compensating debit so the balance actually returns the coins.
+        $debit_txn = null;
+        if ($total_coins > 0) {
+            $owner = (int) dbval("SELECT user_id FROM qa_wallet_transactions WHERE id = ?", [$txn_ids[0]]);
+            $res = wallet_apply(
+                $owner, 'debit', 'refund', $total_coins,
+                [
+                    'reference'   => "quiz:attempt:{$attempt_id}:clawback",
+                    'description' => 'Quiz reward clawback (attempt refunded)',
+                    'coin_value'  => $total_inr > 0 ? intdiv($total_inr, $total_coins) : acc_cv(),
+                    'amount_inr'  => $total_inr,
+                    'source_type' => 'quiz_refund',
+                    'source_id'   => $attempt_id,
+                ]
+            );
+            if (!$res['ok']) {
+                throw new AccException(
+                    "D16 clawback blocked: user cannot return {$total_coins} reward coins "
+                    . '(e.g. already withdrawn/redeemed). Route to SA resolution. Wallet said: ' . $res['error']);
+            }
+            $debit_txn = $res['txn_id'];
+        }
 
         acc_audit('quiz_refund_rewards', 'qa_quiz_attempts', $attempt_id,
-            ['reward_row' => $reward_row_id], ['reward_row' => 'reversed', 'wallet' => 'reversed'], $reason,
-            "quiz:attempt:{$attempt_id}");
+            ['reward_row' => (int) $reward_row['id'], 'status' => 'active',
+             'credit_txns' => $txn_ids, 'coins' => $total_coins],
+            ['reward_row' => 'reversed', 'credit_txns' => 'reversed',
+             'clawback_debit' => $debit_txn, 'coins' => $total_coins],
+            $reason, "quiz:attempt:{$attempt_id}");
         tx_release($outer, true); $committed = true;
-        return (int) $reward_row_id;
+        return (int) $reward_row['id'];
     } catch (Throwable $e) {
         if (!$committed) tx_release($outer, false);
         throw $e;

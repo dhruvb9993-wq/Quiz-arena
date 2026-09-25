@@ -5,6 +5,8 @@ Options -Indexes
 <IfModule mod_rewrite.c>
   RewriteEngine On
   RewriteRule ^app/ - [F,L]
+  RewriteRule ^upgrade/ - [F,L]
+  RewriteRule ^staging/ - [F,L]
   RewriteRule ^\.htaccess - [F,L]
 </IfModule>
 
